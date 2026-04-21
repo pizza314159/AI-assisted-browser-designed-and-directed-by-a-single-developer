@@ -23,11 +23,13 @@ It includes built-in support for VPN configuration files, Tor proxy mode, and mu
 - URL scheme filtering (`file://`, `data:` blocked)
 - Basic anti-fingerprinting scripts
 - Chromium sandbox hardening flags
+- No files saved, everything is gone if you exit the window
 
 ### 🧅 Tor Mode
 - SOCKS5 proxy support (Tor network)
 - One-click Tor toggle
 - Requires local Tor service
+- For now it works best on Linux
 
 ### 🔒 VPN Support
 - Upload `.ovpn` (OpenVPN) files
@@ -41,4 +43,4 @@ It includes built-in support for VPN configuration files, Tor proxy mode, and mu
 
 ### System Requirements
 - Python 3.10+
-- Linux / Windows (Linux recommended for VPN/Tor features)
+- Linux / Windows 
