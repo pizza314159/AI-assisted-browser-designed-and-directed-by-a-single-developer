@@ -1,6 +1,8 @@
 """
 ByteBrowser — hardened browser with file-upload VPN + Tor toggle.
 
+Cross-platform: Linux and Windows.
+
 Security layers applied:
   • HTTPS-only mode (blocks plain HTTP navigation)
   • Strict Content-Security-Policy injected on every page
@@ -15,26 +17,34 @@ Security layers applied:
   • URL bar spoofing protection (strips homograph / non-ASCII)
 
 VPN usage:
-  • Drop a .ovpn file  → OpenVPN tunnel   (needs: sudo apt install openvpn)
-  • Drop a .conf file  → WireGuard tunnel  (needs: sudo apt install wireguard-tools)
+  • Drop a .ovpn file  → OpenVPN tunnel
+    Linux:   sudo apt install openvpn
+    Windows: Install OpenVPN GUI from https://openvpn.net/community-downloads/
+  • Drop a .conf file  → WireGuard tunnel
+    Linux:   sudo apt install wireguard-tools
+    Windows: Install WireGuard from https://www.wireguard.com/install/
 
 Tor usage:
   • Flip the Tor toggle in the toolbar
-    (needs: sudo apt install tor && sudo systemctl start tor)
+    Linux:   sudo apt install tor && sudo systemctl start tor
+    Windows: Install Tor Browser or Expert Bundle from https://www.torproject.org/
 """
 
 import os
+import platform
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import psutil
 from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
-from PySide6.QtCore import QUrl, Qt, Signal, QObject
+from PySide6.QtCore import QUrl, Qt, Signal, QObject, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtNetwork import QNetworkProxy
 from PySide6.QtWidgets import (
@@ -48,10 +58,8 @@ from PySide6.QtWidgets import (
     QToolBar,
     QListWidget,
     QListWidgetItem,
-    QDockWidget,
     QPushButton,
     QLabel,
-    QHBoxLayout,
     QVBoxLayout,
     QWidget,
     QSplitter,
@@ -63,6 +71,13 @@ from PySide6.QtWebEngineCore import (
     QWebEngineSettings,
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
+
+
+# ── Platform detection ─────────────────────────────────────────────────────
+
+IS_WINDOWS = platform.system() == "Windows"
+IS_LINUX   = platform.system() == "Linux"
+IS_MAC     = platform.system() == "Darwin"
 
 
 # ── Constants ──────────────────────────────────────────────────────────────
@@ -77,24 +92,17 @@ IP_CHECK_URLS = [
     "https://icanhazip.com",
 ]
 
-
-# ── Security: blocked domains (trackers, malware, ads) ────────────────────
-# Sourced from well-known blocklists (StevenBlack, abuse.ch categories).
-# Extended at runtime — add your own entries to BLOCKED_DOMAINS.
+# ── Security: blocked domains ─────────────────────────────────────────────
 BLOCKED_DOMAINS: set[str] = {
-    # Malware / phishing infrastructure
     "malware.testcave.xyz", "phishing-test.com",
-    # Major tracker networks
     "doubleclick.net", "googlesyndication.com", "googleadservices.com",
     "adnxs.com", "adsrvr.org", "rubiconproject.com", "openx.net",
     "pubmatic.com", "casalemedia.com", "smartadserver.com",
     "scorecardresearch.com", "quantserve.com", "bluekai.com",
     "demdex.net", "everesttech.net", "rlcdn.com", "krxd.net",
     "taboola.com", "outbrain.com", "revcontent.com",
-    # Fingerprinting / surveillance
     "fingerprintjs.com", "fingerprintjs2.com", "augur.io",
     "iovation.com", "threatmetrix.com", "sift.com",
-    # Telemetry sinks often abused
     "metrics.apple.com", "telemetry.mozilla.org",
     "watson.telemetry.microsoft.com",
 }
@@ -111,8 +119,6 @@ DANGEROUS_EXTENSIONS: set[str] = {
 BLOCKED_SCHEMES: set[str] = {"file", "data", "blob", "javascript"}
 
 # ── Security: CSP injected as a <meta> on every page load ─────────────────
-# Tight policy: only same-origin scripts/styles, no inline eval,
-# block object/embed, restrict form targets.
 INJECTED_CSP = (
     "default-src 'self' https:; "
     "script-src 'self' https: 'strict-dynamic'; "
@@ -134,10 +140,8 @@ INJECT_CSP_JS = f"""
 }})();
 """
 
-# ── Security: anti-fingerprinting JS injected on every page ───────────────
 ANTI_FINGERPRINT_JS = """
 (function() {
-    // Spoof canvas fingerprint
     const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
     HTMLCanvasElement.prototype.toDataURL = function(type) {
         const ctx = this.getContext('2d');
@@ -153,9 +157,7 @@ ANTI_FINGERPRINT_JS = """
         return origToDataURL.apply(this, arguments);
     };
 
-    // Spoof AudioContext fingerprint
     if (window.AudioContext || window.webkitAudioContext) {
-        const AC = window.AudioContext || window.webkitAudioContext;
         const origGetChannelData = AudioBuffer.prototype.getChannelData;
         AudioBuffer.prototype.getChannelData = function() {
             const arr = origGetChannelData.apply(this, arguments);
@@ -165,30 +167,19 @@ ANTI_FINGERPRINT_JS = """
         };
     }
 
-    // Block navigator.plugins enumeration (used for fingerprinting)
     Object.defineProperty(navigator, 'plugins', {
         get: () => Object.create(PluginArray.prototype)
     });
-
-    // Spoof hardwareConcurrency (commonly used for fingerprinting)
     Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 4 });
-
-    // Spoof deviceMemory
     if ('deviceMemory' in navigator)
         Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-
-    // Block battery API
     if (navigator.getBattery)
         navigator.getBattery = () => Promise.reject(new Error('blocked'));
-
-    // Normalise screen resolution (common fingerprint vector)
     Object.defineProperty(screen, 'width',       { get: () => 1920 });
     Object.defineProperty(screen, 'height',      { get: () => 1080 });
     Object.defineProperty(screen, 'availWidth',  { get: () => 1920 });
     Object.defineProperty(screen, 'availHeight', { get: () => 1040 });
     Object.defineProperty(screen, 'colorDepth',  { get: () => 24  });
-
-    // Remove webdriver flag
     Object.defineProperty(navigator, 'webdriver', { get: () => false });
 })();
 """
@@ -196,7 +187,7 @@ ANTI_FINGERPRINT_JS = """
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
-def normalize_url(text):
+def normalize_url(text: str) -> QUrl:
     text = text.strip()
     if not text:
         return QUrl(HOME_URL)
@@ -210,31 +201,21 @@ def normalize_url(text):
 
 
 def sanitize_url(text: str) -> QUrl | None:
-    """
-    Full security sanitization pipeline for user-typed URLs.
-    Returns None if the URL should be blocked entirely.
-    """
-    url = normalize_url(text)
+    url    = normalize_url(text)
     scheme = url.scheme().lower()
 
-    # Block dangerous schemes
     if scheme in BLOCKED_SCHEMES:
         return None
-
-    # Force HTTPS for http:// navigations
     if scheme == "http":
         url = QUrl(url.toString().replace("http://", "https://", 1))
 
-    # Block homograph / non-ASCII hostnames (IDN homograph attacks)
     host = url.host()
     try:
         host.encode("ascii")
     except UnicodeEncodeError:
-        # Re-encode as punycode — safe but warn
         puny = host.encode("idna").decode("ascii")
         url.setHost(puny)
 
-    # Block known bad domains
     if is_blocked_domain(url.host()):
         return None
 
@@ -242,10 +223,9 @@ def sanitize_url(text: str) -> QUrl | None:
 
 
 def is_blocked_domain(host: str) -> bool:
-    host = host.lower().lstrip("www.")
+    host  = host.lower().lstrip("www.")
     if host in BLOCKED_DOMAINS:
         return True
-    # Check parent domains (e.g. sub.doubleclick.net)
     parts = host.split(".")
     for i in range(len(parts) - 1):
         if ".".join(parts[i:]) in BLOCKED_DOMAINS:
@@ -253,13 +233,29 @@ def is_blocked_domain(host: str) -> bool:
     return False
 
 
-def get_public_ip(timeout=8):
+def get_public_ip(timeout: int = 8) -> str | None:
     for url in IP_CHECK_URLS:
         try:
             with urlopen(url, timeout=timeout) as r:
                 return r.read().decode().strip()
         except Exception:
             continue
+    return None
+
+
+def find_executable(name: str, windows_paths: list[str] | None = None) -> str | None:
+    """
+    Locate an executable on PATH, with optional extra search paths on Windows.
+    Returns the full path string or None.
+    """
+    found = shutil.which(name)
+    if found:
+        return found
+    if IS_WINDOWS and windows_paths:
+        for p in windows_paths:
+            candidate = Path(p) / (name + ".exe")
+            if candidate.exists():
+                return str(candidate)
     return None
 
 
@@ -279,19 +275,75 @@ def detect_vpn_type(path: str) -> str:
     return "unknown"
 
 
+# ── Platform-specific VPN helpers ──────────────────────────────────────────
+
+# Common OpenVPN install locations on Windows
+_OVPN_WIN_PATHS = [
+    r"C:\Program Files\OpenVPN\bin",
+    r"C:\Program Files (x86)\OpenVPN\bin",
+]
+
+# Common WireGuard install locations on Windows
+_WG_WIN_PATHS = [
+    r"C:\Program Files\WireGuard",
+]
+
+
+def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
+    """
+    Run a subprocess, adding CREATE_NO_WINDOW on Windows to avoid
+    console popups, and hiding sudo requirement where not applicable.
+    """
+    if IS_WINDOWS:
+        kwargs.setdefault("creationflags", subprocess.CREATE_NO_WINDOW)
+    return subprocess.run(cmd, **kwargs)
+
+
+def _popen(cmd: list[str], **kwargs) -> subprocess.Popen:
+    if IS_WINDOWS:
+        kwargs.setdefault("creationflags", subprocess.CREATE_NO_WINDOW)
+    return subprocess.Popen(cmd, **kwargs)
+
+
+def _sudo(cmd: list[str]) -> list[str]:
+    """Prepend sudo on Linux/Mac; pass through on Windows (admin required at launch)."""
+    if IS_LINUX or IS_MAC:
+        return ["sudo"] + cmd
+    return cmd
+
+
+def _openvpn_bin() -> str | None:
+    return find_executable("openvpn", _OVPN_WIN_PATHS)
+
+
+def _wg_quick_bin() -> str | None:
+    # On Windows, WireGuard uses 'wireguard.exe /installtunnelservice'
+    if IS_WINDOWS:
+        return find_executable("wireguard", _WG_WIN_PATHS)
+    return find_executable("wg-quick")
+
+
+def _wg_bin() -> str | None:
+    return find_executable("wg", _WG_WIN_PATHS)
+
+
 # ── VPN Manager ────────────────────────────────────────────────────────────
 
 class VpnManager(QObject):
-    status_changed = Signal(str, bool)   # (message, is_connected)
-    ip_resolved    = Signal(str, str)    # (real_ip, apparent_ip)
+    status_changed = Signal(str, bool)
+    ip_resolved    = Signal(str, str)
 
     def __init__(self):
         super().__init__()
-        self._pre_vpn_ip   = None
-        self._wg_iface     = None
-        self._ovpn_tmpfile = None
-        self.vpn_ip        = None
-        self.vpn_type      = None
+        self._pre_vpn_ip    = None
+        self._wg_iface      = None
+        self._ovpn_proc     = None     # Windows: Popen; Linux: daemon pid
+        self._ovpn_tmpfile  = None
+        self._wg_conf_copy  = None     # Windows tunnel conf copy path
+        self.vpn_ip         = None
+        self.vpn_type       = None
+
+    # ── Public API ────────────────────────────────────────────────
 
     def connect_file(self, config_path: str, real_ip: str):
         self.disconnect()
@@ -311,22 +363,9 @@ class VpnManager(QObject):
     def disconnect(self):
         try:
             if self.vpn_type == "openvpn":
-                subprocess.run(
-                    ["sudo", "pkill", "-f", "bytebrowser_vpn_"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
-                if self._ovpn_tmpfile:
-                    try:
-                        os.unlink(self._ovpn_tmpfile)
-                    except Exception:
-                        pass
-                    self._ovpn_tmpfile = None
-            elif self.vpn_type == "wireguard" and self._wg_iface:
-                subprocess.run(
-                    ["sudo", "wg-quick", "down", self._wg_iface],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
-                self._wg_iface = None
+                self._stop_openvpn()
+            elif self.vpn_type == "wireguard":
+                self._stop_wireguard()
         except Exception:
             pass
         self.vpn_ip   = None
@@ -334,7 +373,7 @@ class VpnManager(QObject):
         self.status_changed.emit("VPN disconnected", False)
 
     @property
-    def is_connected(self):
+    def is_connected(self) -> bool:
         return self.vpn_ip is not None
 
     # ── Internal ──────────────────────────────────────────────────
@@ -345,46 +384,134 @@ class VpnManager(QObject):
         elif vpn_type == "wireguard":
             self._start_wireguard(config_path)
 
+    # ── OpenVPN ───────────────────────────────────────────────────
+
     def _start_openvpn(self, config_path: str):
-        tmp = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".ovpn", delete=False, prefix="bytebrowser_vpn_"
-        )
+        ovpn = _openvpn_bin()
+        if not ovpn:
+            if IS_WINDOWS:
+                self.status_changed.emit(
+                    "❌ openvpn.exe not found.\n"
+                    "Install OpenVPN GUI: https://openvpn.net/community-downloads/", False
+                )
+            else:
+                self.status_changed.emit(
+                    "❌ openvpn not found — install: sudo apt install openvpn", False
+                )
+            return
+
+        # Write a temp copy so we control the path (avoids sudo path issues)
         try:
+            tmp = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".ovpn", delete=False, prefix="bytebrowser_vpn_"
+            )
             with open(config_path, "r", errors="replace") as f:
                 tmp.write(f.read())
             tmp.flush()
             tmp.close()
             self._ovpn_tmpfile = tmp.name
         except Exception as e:
-            self.status_changed.emit(f"❌ Could not read config: {e}", False)
+            self.status_changed.emit(f"❌ Could not stage config: {e}", False)
             return
 
-        cmd = ["sudo", "openvpn", "--config", tmp.name,
-               "--daemon", "--log", "/tmp/bytebrowser_vpn.log"]
+        if IS_WINDOWS:
+            self._start_openvpn_windows(ovpn)
+        else:
+            self._start_openvpn_linux(ovpn)
+
+    def _start_openvpn_windows(self, ovpn_bin: str):
+        """
+        On Windows run OpenVPN directly (requires admin or OpenVPN service).
+        We use --service with a management interface so we can stop it cleanly.
+        """
+        cmd = [
+            ovpn_bin,
+            "--config", self._ovpn_tmpfile,
+            "--log", os.path.join(tempfile.gettempdir(), "bytebrowser_vpn.log"),
+        ]
         try:
-            subprocess.run(cmd, check=True, timeout=12,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._ovpn_proc = _popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except PermissionError:
+            self.status_changed.emit(
+                "❌ Permission denied — run ByteBrowser as Administrator for VPN.", False
+            )
+            return
+        except Exception as e:
+            self.status_changed.emit(f"❌ OpenVPN launch failed: {e}", False)
+            return
+        self._poll_for_ip("OpenVPN")
+
+    def _start_openvpn_linux(self, ovpn_bin: str):
+        """On Linux run openvpn as a daemon via sudo."""
+        cmd = _sudo([
+            ovpn_bin,
+            "--config", self._ovpn_tmpfile,
+            "--daemon",
+            "--log", "/tmp/bytebrowser_vpn.log",
+        ])
+        try:
+            _run(cmd, check=True, timeout=15,
+                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except FileNotFoundError:
             self.status_changed.emit(
-                "❌ openvpn not found — install: sudo apt install openvpn", False
+                "❌ sudo not found — cannot launch openvpn.", False
             )
             return
         except subprocess.CalledProcessError as e:
-            self.status_changed.emit(f"❌ OpenVPN error: {e}", False)
+            self.status_changed.emit(f"❌ OpenVPN error (exit {e.returncode})", False)
             return
         except subprocess.TimeoutExpired:
-            pass
-
+            pass  # daemon started, timeout expected
         self._poll_for_ip("OpenVPN")
 
+    def _stop_openvpn(self):
+        if IS_WINDOWS:
+            if self._ovpn_proc and self._ovpn_proc.poll() is None:
+                self._ovpn_proc.terminate()
+                try:
+                    self._ovpn_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self._ovpn_proc.kill()
+            self._ovpn_proc = None
+        else:
+            _run(
+                _sudo(["pkill", "-f", "bytebrowser_vpn_"]),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        if self._ovpn_tmpfile:
+            try:
+                os.unlink(self._ovpn_tmpfile)
+            except Exception:
+                pass
+            self._ovpn_tmpfile = None
+
+    # ── WireGuard ─────────────────────────────────────────────────
+
     def _start_wireguard(self, config_path: str):
-        iface = "wg-bb0"
-        dest  = f"/tmp/{iface}.conf"
+        if IS_WINDOWS:
+            self._start_wireguard_windows(config_path)
+        else:
+            self._start_wireguard_linux(config_path)
+
+    def _start_wireguard_linux(self, config_path: str):
+        wq = _wg_quick_bin()
+        if not wq:
+            self.status_changed.emit(
+                "❌ wg-quick not found — install: sudo apt install wireguard-tools", False
+            )
+            return
+
+        iface    = "wg-bb0"
+        dest     = f"/tmp/{iface}.conf"
         try:
             with open(config_path, "r", errors="replace") as f:
                 data = f.read()
-            proc = subprocess.run(
-                ["sudo", "tee", dest],
+            proc = _run(
+                _sudo(["tee", dest]),
                 input=data.encode(), capture_output=True,
             )
             if proc.returncode != 0:
@@ -395,9 +522,9 @@ class VpnManager(QObject):
             return
 
         try:
-            result = subprocess.run(
-                ["sudo", "wg-quick", "up", dest],
-                capture_output=True, text=True, timeout=20,
+            result = _run(
+                _sudo([wq, "up", dest]),
+                capture_output=True, text=True, timeout=25,
             )
             if result.returncode != 0:
                 err = (result.stderr or result.stdout or "unknown error").strip()
@@ -412,14 +539,90 @@ class VpnManager(QObject):
         except subprocess.TimeoutExpired:
             self.status_changed.emit("❌ wg-quick timed out", False)
             return
+        self._poll_for_ip("WireGuard")
+
+    def _start_wireguard_windows(self, config_path: str):
+        """
+        On Windows, WireGuard tunnels are managed via:
+          wireguard.exe /installtunnelservice <conf_path>
+        The conf file must live in %PROGRAMDATA%\\WireGuard\\
+        Requires the WireGuard service + admin rights.
+        """
+        wg = find_executable("wireguard", _WG_WIN_PATHS)
+        if not wg:
+            self.status_changed.emit(
+                "❌ wireguard.exe not found.\n"
+                "Install WireGuard: https://www.wireguard.com/install/", False
+            )
+            return
+
+        # WireGuard on Windows requires the conf in its data directory
+        wg_data = Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) / "WireGuard"
+        try:
+            wg_data.mkdir(parents=True, exist_ok=True)
+            dest = wg_data / "bytebrowser_wg.conf"
+            import shutil as _sh
+            _sh.copy2(config_path, str(dest))
+            self._wg_conf_copy = str(dest)
+        except PermissionError:
+            self.status_changed.emit(
+                "❌ Permission denied — run ByteBrowser as Administrator for WireGuard.", False
+            )
+            return
+        except Exception as e:
+            self.status_changed.emit(f"❌ Could not stage WireGuard config: {e}", False)
+            return
+
+        try:
+            result = _run(
+                [wg, "/installtunnelservice", str(dest)],
+                capture_output=True, text=True, timeout=20,
+            )
+            if result.returncode != 0:
+                err = (result.stderr or result.stdout or "unknown error").strip()
+                self.status_changed.emit(f"❌ WireGuard install tunnel error: {err}", False)
+                return
+            self._wg_iface = "bytebrowser_wg"
+        except subprocess.TimeoutExpired:
+            self.status_changed.emit("❌ WireGuard tunnel install timed out", False)
+            return
+        except Exception as e:
+            self.status_changed.emit(f"❌ WireGuard error: {e}", False)
+            return
 
         self._poll_for_ip("WireGuard")
 
+    def _stop_wireguard(self):
+        if IS_WINDOWS:
+            wg = find_executable("wireguard", _WG_WIN_PATHS)
+            if wg and self._wg_iface:
+                _run(
+                    [wg, "/uninstalltunnelservice", self._wg_iface],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            if self._wg_conf_copy:
+                try:
+                    os.unlink(self._wg_conf_copy)
+                except Exception:
+                    pass
+                self._wg_conf_copy = None
+        else:
+            if self._wg_iface:
+                wq = _wg_quick_bin()
+                if wq:
+                    _run(
+                        _sudo([wq, "down", f"/tmp/{self._wg_iface}.conf"]),
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+        self._wg_iface = None
+
+    # ── IP polling ────────────────────────────────────────────────
+
     def _poll_for_ip(self, label: str):
-        deadline = time.time() + 30
+        deadline = time.time() + 35
         while time.time() < deadline:
             time.sleep(2)
-            ip = get_public_ip(timeout=5)
+            ip = get_public_ip(timeout=6)
             if ip and ip != self._pre_vpn_ip:
                 self.vpn_ip = ip
                 self.status_changed.emit(
@@ -428,7 +631,8 @@ class VpnManager(QObject):
                 self.ip_resolved.emit(self._pre_vpn_ip or "?", ip)
                 return
         self.status_changed.emit(
-            f"⚠️  {label} may not have connected — IP unchanged after 30 s", False
+            f"⚠️  {label} may not have connected — IP unchanged after 35 s\n"
+            f"Check the VPN config and that the service has required permissions.", False
         )
 
 
@@ -482,7 +686,15 @@ class VpnPanel(QWidget):
         title.setStyleSheet("font-size:15px; font-weight:bold; color:#a0b4ff;")
         root.addWidget(title)
 
-        subtitle = QLabel("Upload your own .ovpn or .conf file to connect.")
+        platform_note = (
+            "Upload your own .ovpn or .conf file.\n"
+            "Windows: run as Administrator.\n"
+            "Linux: needs sudo + openvpn/wireguard-tools."
+        ) if IS_WINDOWS else (
+            "Upload your own .ovpn or .conf file to connect.\n"
+            "Needs openvpn / wireguard-tools + sudo."
+        )
+        subtitle = QLabel(platform_note)
         subtitle.setWordWrap(True)
         subtitle.setStyleSheet("color:#888; font-size:11px;")
         root.addWidget(subtitle)
@@ -532,10 +744,20 @@ class VpnPanel(QWidget):
 
         root.addStretch()
 
-        hint = QLabel(
-            "Works with any provider that gives you an OpenVPN or WireGuard config.\n"
-            "Needs openvpn / wireguard-tools installed + sudo."
-        )
+        root.addWidget(self._separator())
+
+        if IS_WINDOWS:
+            hint_text = (
+                "OpenVPN: install OpenVPN GUI from openvpn.net\n"
+                "WireGuard: install from wireguard.com\n"
+                "Both require Administrator rights."
+            )
+        else:
+            hint_text = (
+                "sudo apt install openvpn wireguard-tools\n"
+                "Works with any provider's .ovpn or .conf file."
+            )
+        hint = QLabel(hint_text)
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#444; font-size:10px;")
         root.addWidget(hint)
@@ -557,7 +779,7 @@ class VpnPanel(QWidget):
         self.real_ip = ip
         self.real_ip_lbl.setText(f"Your IP: {ip or 'unknown'}")
 
-    def _on_ip_resolved(self, real_ip, vpn_ip):
+    def _on_ip_resolved(self, real_ip: str, vpn_ip: str):
         self.real_ip_lbl.setText(f"Your IP: {real_ip}")
         self.vpn_ip_lbl.setStyleSheet("color:#51cf66; font-size:11px;")
         self.vpn_ip_lbl.setText(f"VPN IP: {vpn_ip}  ✅")
@@ -579,8 +801,8 @@ class VpnPanel(QWidget):
             )
             return
         self._config_path = path
-        name        = Path(path).name
-        type_label  = "OpenVPN" if vpn_type == "openvpn" else "WireGuard"
+        name       = Path(path).name
+        type_label = "OpenVPN" if vpn_type == "openvpn" else "WireGuard"
         self.file_lbl.setText(f"📄 {name}\n({type_label})")
         self.file_lbl.setStyleSheet("color:#a0b4ff; font-size:10px;")
         self.connect_btn.setEnabled(True)
@@ -605,7 +827,10 @@ class VpnPanel(QWidget):
 
     def _on_status(self, msg: str, connected: bool):
         self.status_lbl.setText(msg)
-        color = "#51cf66" if connected else ("#ff7070" if ("❌" in msg or "⚠️" in msg) else "#aaa")
+        color = (
+            "#51cf66" if connected
+            else ("#ff7070" if ("❌" in msg or "⚠️" in msg) else "#aaa")
+        )
         self.status_lbl.setStyleSheet(f"color:{color}; font-size:11px;")
         if connected:
             self.connect_btn.setEnabled(False)
@@ -619,109 +844,79 @@ class VpnPanel(QWidget):
 
 class BrowserPage(QWebEnginePage):
     """
-    Hardened QWebEnginePage:
-      - Blocks navigations to dangerous schemes / blocked domains
-      - Forces HTTPS upgrades
-      - Intercepts certificate errors (hard block)
-      - Kills popup / new-window requests
-      - Injects CSP meta tag + anti-fingerprinting JS on every load
+    Hardened QWebEnginePage.
     """
 
     def javaScriptConsoleMessage(self, level, message, line_number, source_id):
-        pass  # Silence console noise; don't leak internals
+        pass
 
-    # ── Block cert errors hard (no click-through) ──────────────────
     def certificateError(self, error):
-        # Reject ALL certificate errors — no "proceed anyway" option.
-        # This stops SSL-strip, MITM, and expired-cert attacks cold.
         error.rejectCertificate()
         return True
 
-    # ── Kill popups and new-window hijacks ─────────────────────────
     def createWindow(self, win_type):
-        # Open in a new tab in the same window instead of spawning
-        # a new uncontrolled window (common clickjacking vector).
         main = self.view().window()
         if hasattr(main, "add_new_tab"):
             main.add_new_tab()
             return main.current_browser().page()
-        return None  # Block if we can't route safely
+        return None
 
-    # ── Intercept every navigation request ────────────────────────
     def acceptNavigationRequest(self, url, nav_type, is_main_frame):
         scheme = url.scheme().lower()
         host   = url.host().lower()
 
-        # Hard-block dangerous schemes
         if scheme in BLOCKED_SCHEMES:
             return False
-
-        # Hard-block known malicious / tracking domains
         if is_blocked_domain(host):
             return False
 
-        # Upgrade HTTP → HTTPS for main-frame navigations
         if scheme == "http" and is_main_frame:
             https_url = QUrl(url.toString().replace("http://", "https://", 1))
-            # Schedule the upgrade after this call returns
-            QUrl_upgraded = https_url  # captured for lambda
-            from PySide6.QtCore import QTimer
-            QTimer.singleShot(0, lambda: self.view().setUrl(QUrl_upgraded))
-            return False  # Cancel the HTTP load
+            QTimer.singleShot(0, lambda: self.view().setUrl(https_url))
+            return False
 
         return True
 
-    # ── Inject security JS on every page ──────────────────────────
-    def javaScriptFinished(self):
-        pass
-
-    def loadFinished_security_inject(self, ok):
+    def loadFinished_security_inject(self, ok: bool):
         if ok:
             self.runJavaScript(INJECT_CSP_JS)
             self.runJavaScript(ANTI_FINGERPRINT_JS)
 
 
 class BrowserTab(QWebEngineView):
-    def __init__(self, profile, parent=None):
+    def __init__(self, profile: QWebEngineProfile, parent=None):
         super().__init__(parent)
         page = BrowserPage(profile, self)
         self.setPage(page)
-        # Wire security JS injection to every successful load
         self.loadFinished.connect(page.loadFinished_security_inject)
 
 
 def apply_security_settings(profile: QWebEngineProfile):
-    """Apply hardened QWebEngineSettings to any profile."""
-    s = profile.settings()
+    s  = profile.settings()
     WA = QWebEngineSettings.WebAttribute
 
-    # ── Disable attack surfaces ────────────────────────────────────
-    s.setAttribute(WA.JavascriptCanOpenWindows,         False)  # no popup spawning
-    s.setAttribute(WA.JavascriptCanAccessClipboard,     False)  # no clipboard theft
-    s.setAttribute(WA.LocalContentCanAccessRemoteUrls,  False)  # no local→remote leaks
-    s.setAttribute(WA.LocalContentCanAccessFileUrls,    False)  # no file:// enumeration
-    s.setAttribute(WA.AllowRunningInsecureContent,      False)  # block mixed content
-    s.setAttribute(WA.AllowGeolocationOnInsecureOrigins,False)  # no geo on HTTP
-    s.setAttribute(WA.WebGLEnabled,                     False)  # WebGL fingerprinting
-    s.setAttribute(WA.Accelerated2dCanvasEnabled,       False)  # canvas fingerprinting
-    s.setAttribute(WA.AutoLoadIconsForPage,             True)   # favicons OK
-    s.setAttribute(WA.PluginsEnabled,                   False)  # no NPAPI/PPAPI plugins
-    s.setAttribute(WA.PdfViewerEnabled,                 True)   # PDF viewing OK
-    s.setAttribute(WA.FullScreenSupportEnabled,         False)  # block fullscreen hijack
-    s.setAttribute(WA.ScreenCaptureEnabled,             False)  # block screen capture
-    s.setAttribute(WA.WebRTCPublicInterfacesOnly,       True)   # prevent WebRTC IP leak
-    s.setAttribute(WA.DnsPrefetchEnabled,               False)  # no DNS prefetch leaks
-    s.setAttribute(WA.NavigateOnDropEnabled,            False)  # block drag-drop navigation
+    s.setAttribute(WA.JavascriptCanOpenWindows,          False)
+    s.setAttribute(WA.JavascriptCanAccessClipboard,      False)
+    s.setAttribute(WA.LocalContentCanAccessRemoteUrls,   False)
+    s.setAttribute(WA.LocalContentCanAccessFileUrls,     False)
+    s.setAttribute(WA.AllowRunningInsecureContent,       False)
+    s.setAttribute(WA.AllowGeolocationOnInsecureOrigins, False)
+    s.setAttribute(WA.WebGLEnabled,                      False)
+    s.setAttribute(WA.Accelerated2dCanvasEnabled,        False)
+    s.setAttribute(WA.AutoLoadIconsForPage,              True)
+    s.setAttribute(WA.PluginsEnabled,                    False)
+    s.setAttribute(WA.PdfViewerEnabled,                  True)
+    s.setAttribute(WA.FullScreenSupportEnabled,          False)
+    s.setAttribute(WA.ScreenCaptureEnabled,              False)
+    s.setAttribute(WA.WebRTCPublicInterfacesOnly,        True)
+    s.setAttribute(WA.DnsPrefetchEnabled,                False)
+    s.setAttribute(WA.NavigateOnDropEnabled,             False)
+    s.setAttribute(WA.JavascriptEnabled,                 True)
+    s.setAttribute(WA.LocalStorageEnabled,               True)
+    s.setAttribute(WA.ScrollAnimatorEnabled,             True)
+    s.setAttribute(WA.SpatialNavigationEnabled,          False)
 
-    # ── Keep usable ───────────────────────────────────────────────
-    s.setAttribute(WA.JavascriptEnabled,                True)   # JS on (needed for web)
-    s.setAttribute(WA.LocalStorageEnabled,              True)   # storage on (normal mode)
-    s.setAttribute(WA.ScrollAnimatorEnabled,            True)   # smooth scroll OK
-    s.setAttribute(WA.SpatialNavigationEnabled,         False)
-
-    # ── HTTP Strict Transport Security ────────────────────────────
     profile.setHttpAcceptLanguage("en-US,en;q=0.9")
-    # Spoof a generic UA — avoids unique fingerprinting via user-agent
     profile.setHttpUserAgent(
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -729,11 +924,10 @@ def apply_security_settings(profile: QWebEngineProfile):
     )
 
 
-def build_incognito_profile(parent, use_tor=False):
-    profile = QWebEngineProfile(parent)   # no name → off-the-record
+def build_incognito_profile(parent, use_tor: bool = False) -> QWebEngineProfile:
+    profile = QWebEngineProfile(parent)
     apply_security_settings(profile)
-    # Extra restrictions for incognito/tor
-    s = profile.settings()
+    s  = profile.settings()
     WA = QWebEngineSettings.WebAttribute
     s.setAttribute(WA.LocalStorageEnabled, False)
     if use_tor:
@@ -752,7 +946,7 @@ def clear_tor_proxy():
 # ── Main Window ────────────────────────────────────────────────────────────
 
 class BrowserWindow(QMainWindow):
-    def __init__(self, tor_mode=False, profile=None):
+    def __init__(self, tor_mode: bool = False, profile: QWebEngineProfile | None = None):
         super().__init__()
 
         self.tor_mode    = tor_mode
@@ -815,7 +1009,7 @@ class BrowserWindow(QMainWindow):
         self.tor_btn.clicked.connect(self.toggle_tor)
         self.navbar.addWidget(self.tor_btn)
 
-        # ── Status bar ──────────────────────────â─────────────────
+        # ── Status bar ────────────────────────────────────────────
         self.status = QStatusBar()
         self.setStatusBar(self.status)
         self.vpn_manager.status_changed.connect(
@@ -824,6 +1018,7 @@ class BrowserWindow(QMainWindow):
         self._update_status()
 
         # ── Downloads dock ────────────────────────────────────────
+        from PySide6.QtWidgets import QDockWidget
         self.downloads_dock = QDockWidget("Downloads", self)
         self.downloads_list = QListWidget()
         self.downloads_dock.setWidget(self.downloads_list)
@@ -836,7 +1031,7 @@ class BrowserWindow(QMainWindow):
 
     # ── Tor ───────────────────────────────────────────────────────
 
-    def _style_tor_btn(self, active):
+    def _style_tor_btn(self, active: bool):
         if active:
             self.tor_btn.setText("🧅  Tor ON")
             self.tor_btn.setStyleSheet(
@@ -852,10 +1047,23 @@ class BrowserWindow(QMainWindow):
                 "QPushButton:hover{background:#333;color:#ccc;}"
             )
 
-    def toggle_tor(self, checked):
+    def toggle_tor(self, checked: bool):
         action = "Enable" if checked else "Disable"
-        extra  = f"\n\nRequires Tor running on {TOR_PROXY_HOST}:{TOR_PROXY_PORT}." if checked else ""
-        reply  = QMessageBox.question(
+        if checked:
+            if IS_WINDOWS:
+                extra = (
+                    f"\n\nRequires Tor running on {TOR_PROXY_HOST}:{TOR_PROXY_PORT}.\n"
+                    "Install: https://www.torproject.org/download/tor/"
+                )
+            else:
+                extra = (
+                    f"\n\nRequires Tor running on {TOR_PROXY_HOST}:{TOR_PROXY_PORT}.\n"
+                    "Install: sudo apt install tor && sudo systemctl start tor"
+                )
+        else:
+            extra = ""
+
+        reply = QMessageBox.question(
             self, f"{action} Tor Mode",
             f"{action} Tor? Current window will reopen.{extra}",
             QMessageBox.Yes | QMessageBox.No,
@@ -881,11 +1089,11 @@ class BrowserWindow(QMainWindow):
                 "Ready — upload a .ovpn or .conf in the VPN panel to mask your location"
             )
 
-    # ── Shortcuts ────────────────────────────────────────────────
+    # ── Shortcuts ─────────────────────────────────────────────────
 
     def setup_shortcuts(self):
         self._shortcuts = []
-        def add(key, fn):
+        def add(key: str, fn):
             a = QAction(self)
             a.setShortcut(QKeySequence(key))
             a.triggered.connect(fn)
@@ -897,19 +1105,19 @@ class BrowserWindow(QMainWindow):
         add("Ctrl+R", lambda: self.current_browser().reload())
         add("Ctrl+M", self.toggle_mute_current_tab)
 
-    # ── Tabs ─────────────────────────────────────────────────────
+    # ── Tabs ──────────────────────────────────────────────────────
 
-    def add_new_tab(self, qurl=None, label="New Tab"):
-        qurl = qurl or QUrl(HOME_URL)
+    def add_new_tab(self, qurl: QUrl | None = None, label: str = "New Tab"):
+        qurl    = qurl or QUrl(HOME_URL)
         browser = BrowserTab(self.profile, self)
         browser.setUrl(qurl)
         i = self.tabs.addTab(browser, label)
         self.tabs.setCurrentIndex(i)
         browser.urlChanged.connect(self.update_urlbar)
-        browser.titleChanged.connect(lambda t: self.tabs.setTabText(i, t[:22]))
+        browser.titleChanged.connect(lambda t, idx=i: self.tabs.setTabText(idx, t[:22]))
         browser.page().audioMutedChanged.connect(self.mute_action.setChecked)
 
-    def close_tab(self, i):
+    def close_tab(self, i: int):
         if self.tabs.count() == 1:
             self.close()
         else:
@@ -918,16 +1126,16 @@ class BrowserWindow(QMainWindow):
     def close_current_tab(self):
         self.close_tab(self.tabs.currentIndex())
 
-    def current_browser(self):
+    def current_browser(self) -> BrowserTab:
         return self.tabs.currentWidget()
 
-    def current_tab_changed(self, i):
+    def current_tab_changed(self, i: int):
         b = self.current_browser()
         if b:
             self.url_bar.setText(b.url().toString())
             self.mute_action.setChecked(b.page().isAudioMuted())
 
-    # ── Navigation ───────────────────────────────────────────────
+    # ── Navigation ────────────────────────────────────────────────
 
     def navigate_to_url(self):
         raw  = self.url_bar.text()
@@ -944,6 +1152,7 @@ class BrowserWindow(QMainWindow):
 
     def focus_url_bar(self):
         self.url_bar.setFocus()
+        self.url_bar.selectAll()
 
     def update_urlbar(self, url: QUrl):
         text   = url.toString()
@@ -952,7 +1161,6 @@ class BrowserWindow(QMainWindow):
 
         self.url_bar.setText(text)
 
-        # Visual security badge in status bar
         if is_blocked_domain(host):
             self.status.showMessage(f"🚫 Blocked domain: {host}")
         elif scheme == "https":
@@ -962,25 +1170,25 @@ class BrowserWindow(QMainWindow):
         else:
             self.status.showMessage(f"  {text[:120]}")
 
-    # ── Audio ────────────────────────────────────────────────────
+    # ── Audio ─────────────────────────────────────────────────────
 
     def toggle_mute_current_tab(self):
         p = self.current_browser().page()
         p.setAudioMuted(not p.isAudioMuted())
 
-    # ── Downloads ────────────────────────────────────────────────
+    # ── Downloads ─────────────────────────────────────────────────
 
     def handle_download_request(self, download):
-        filename  = download.downloadFileName()
-        ext       = Path(filename).suffix.lower()
+        filename = download.downloadFileName()
+        ext      = Path(filename).suffix.lower()
 
-        # Warn on dangerous extensions
+    # ⚠️ Ask BEFORE accepting (Qt requirement)
         if ext in DANGEROUS_EXTENSIONS:
             reply = QMessageBox.warning(
                 self,
-                "⚠️  Potentially Dangerous File",
+                "⚠️ Potentially Dangerous File",
                 f"'{filename}' is a {ext} file that could execute code on your system.\n\n"
-                "Only proceed if you trust the source completely.\n\nDownload anyway?",
+                "Download anyway?",
                 QMessageBox.Yes | QMessageBox.Cancel,
             )
             if reply != QMessageBox.Yes:
@@ -991,48 +1199,71 @@ class BrowserWindow(QMainWindow):
         if not path:
             download.cancel()
             return
-        download.setDownloadFileName(os.path.basename(path))
+
+    # ✅ MUST be before accept()
         download.setDownloadDirectory(os.path.dirname(path))
-        item = QListWidgetItem(f"⬇️  {filename}")
+        download.setDownloadFileName(os.path.basename(path))
+
+        item = QListWidgetItem(f"⬇️ {filename}")
         self.downloads_list.addItem(item)
         self.downloads_dock.show()
-        download.downloadProgress.connect(
-            lambda r, t: item.setText(
-                f"{filename}  {int(r/t*100) if t else 0}%"
-            )
-        )
-        download.stateChanged.connect(
-            lambda s: item.setText(f"{'✅ Done' if s == 2 else '❌ Failed'}  —  {filename}")
-        )
-        download.accept()
 
-    def closeEvent(self, event):
-        self.vpn_manager.disconnect()
-        super().closeEvent(event)
+    # ✅ Qt6 signals
+        def update_progress():
+            received = download.receivedBytes()
+            total    = download.totalBytes()
+            percent  = int((received / total) * 100) if total > 0 else 0
+            item.setText(f"{filename} — {percent}%")
+
+        def update_state(state):
+            from PySide6.QtWebEngineCore import QWebEngineDownloadRequest
+
+            def update_state(state):
+                if state == QWebEngineDownloadRequest.DownloadCompleted:
+                    item.setText(f"✅ Done — {filename}")
+                elif state == QWebEngineDownloadRequest.DownloadInterrupted:
+                    item.setText(f"❌ Failed — {filename}")
+                elif state == QWebEngineDownloadRequest.DownloadCancelled:
+                    item.setText(f"⛔ Cancelled — {filename}")
+
+                    download.receivedBytesChanged.connect(update_progress)
+                    download.stateChanged.connect(update_state)
+
+    # ✅ Accept LAST
+        download.accept()
 
 
 # ── Entry point ────────────────────────────────────────────────────────────
 
 def main():
-    # ── Harden Chromium renderer process ──────────────────────────
-    # Must be set before QApplication / Chromium initialises.
+    # Harden Chromium renderer — must be set before QApplication
     chromium_flags = " ".join([
-        "--log-level=3",                    # suppress NSS noise
-        "--disable-background-networking",  # no background phone-home
+        "--log-level=3",
+        "--disable-background-networking",
         "--disable-default-apps",
-        "--disable-extensions",             # no extension injection
-        "--disable-sync",                   # no Google sync
-        "--disable-translate",              # no external translate requests
-        "--metrics-recording-only",         # no UMA upload
+        "--disable-extensions",
+        "--disable-sync",
+        "--disable-translate",
+        "--metrics-recording-only",
         "--no-first-run",
         "--safebrowsing-disable-auto-update",
         "--password-store=basic",
-        "--disable-features=MediaRouter",   # no Cast/media-router leaks
+        "--disable-features=MediaRouter",
     ])
+
+    if IS_WINDOWS:
+        # On Windows, also disable GPU sandbox issues and enable ANGLE
+        chromium_flags += " --disable-gpu-sandbox --use-angle=d3d11"
+
     os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = chromium_flags
+
+    # High-DPI support (important for Windows scaling)
+    if IS_WINDOWS:
+        os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
 
     app = QApplication(sys.argv)
     app.setApplicationName("ByteBrowser")
+
     win = BrowserWindow()
     win.show()
     sys.exit(app.exec())
