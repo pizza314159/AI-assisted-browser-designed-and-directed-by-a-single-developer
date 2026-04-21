@@ -1,5 +1,5 @@
 """
-ByteBrowser — hardened browser with file-upload VPN + Tor toggle.
+Ittrium Browser — hardened browser with file-upload VPN + Tor toggle.
 
 Cross-platform: Linux and Windows.
 
@@ -403,7 +403,7 @@ class VpnManager(QObject):
         # Write a temp copy so we control the path (avoids sudo path issues)
         try:
             tmp = tempfile.NamedTemporaryFile(
-                mode="w", suffix=".ovpn", delete=False, prefix="bytebrowser_vpn_"
+                mode="w", suffix=".ovpn", delete=False, prefix="Ittrium Browser_vpn_"
             )
             with open(config_path, "r", errors="replace") as f:
                 tmp.write(f.read())
@@ -427,7 +427,7 @@ class VpnManager(QObject):
         cmd = [
             ovpn_bin,
             "--config", self._ovpn_tmpfile,
-            "--log", os.path.join(tempfile.gettempdir(), "bytebrowser_vpn.log"),
+            "--log", os.path.join(tempfile.gettempdir(), "Ittrium Browser_vpn.log"),
         ]
         try:
             self._ovpn_proc = _popen(
@@ -437,7 +437,7 @@ class VpnManager(QObject):
             )
         except PermissionError:
             self.status_changed.emit(
-                "❌ Permission denied — run ByteBrowser as Administrator for VPN.", False
+                "❌ Permission denied — run Ittrium Browser as Administrator for VPN.", False
             )
             return
         except Exception as e:
@@ -451,7 +451,7 @@ class VpnManager(QObject):
             ovpn_bin,
             "--config", self._ovpn_tmpfile,
             "--daemon",
-            "--log", "/tmp/bytebrowser_vpn.log",
+            "--log", "/tmp/Ittrium Browser_vpn.log",
         ])
         try:
             _run(cmd, check=True, timeout=15,
@@ -479,7 +479,7 @@ class VpnManager(QObject):
             self._ovpn_proc = None
         else:
             _run(
-                _sudo(["pkill", "-f", "bytebrowser_vpn_"]),
+                _sudo(["pkill", "-f", "Ittrium Browser_vpn_"]),
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
         if self._ovpn_tmpfile:
@@ -560,13 +560,13 @@ class VpnManager(QObject):
         wg_data = Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) / "WireGuard"
         try:
             wg_data.mkdir(parents=True, exist_ok=True)
-            dest = wg_data / "bytebrowser_wg.conf"
+            dest = wg_data / "Ittrium Browser_wg.conf"
             import shutil as _sh
             _sh.copy2(config_path, str(dest))
             self._wg_conf_copy = str(dest)
         except PermissionError:
             self.status_changed.emit(
-                "❌ Permission denied — run ByteBrowser as Administrator for WireGuard.", False
+                "❌ Permission denied — run Ittrium Browser as Administrator for WireGuard.", False
             )
             return
         except Exception as e:
@@ -582,7 +582,7 @@ class VpnManager(QObject):
                 err = (result.stderr or result.stdout or "unknown error").strip()
                 self.status_changed.emit(f"❌ WireGuard install tunnel error: {err}", False)
                 return
-            self._wg_iface = "bytebrowser_wg"
+            self._wg_iface = "Ittrium Browser_wg"
         except subprocess.TimeoutExpired:
             self.status_changed.emit("❌ WireGuard tunnel install timed out", False)
             return
@@ -952,7 +952,7 @@ class BrowserWindow(QMainWindow):
         self.tor_mode    = tor_mode
         self.vpn_manager = VpnManager()
 
-        self.setWindowTitle("ByteBrowser 🧅 [TOR]" if tor_mode else "ByteBrowser")
+        self.setWindowTitle("Ittrium Browser 🧅 [TOR]" if tor_mode else "Ittrium Browser")
         self.resize(1400, 860)
 
         if profile:
@@ -1262,7 +1262,7 @@ def main():
         os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
 
     app = QApplication(sys.argv)
-    app.setApplicationName("ByteBrowser")
+    app.setApplicationName("Ittrium Browser")
 
     win = BrowserWindow()
     win.show()
@@ -1271,4 +1271,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
