@@ -45,4 +45,4 @@ It includes built-in support for VPN configuration files, Tor proxy mode, and mu
 - Python 3.10+
 - Linux / Windows
 - For tor to work the app needs to have a folder named tor besides it that has tor in it
-- For the python and the exe file to work you need to download the imports!
+
